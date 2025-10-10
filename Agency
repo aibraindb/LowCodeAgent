@@ -1,0 +1,154 @@
+graph TD
+  UI[QA UI] --> GW[API Gateway]
+  Approvals[Approval Dept\n(Batch Drop)] -->|batches| Ingest[Batch Ingestor]
+
+  subgraph ControlPlane[Control Plane]
+    Reg[Model & Config Registry\n(models, checks, type flows, versions)]
+    Sched[Run Scheduler\n(queue, rate limits)]
+  end
+
+  subgraph DataPlane[Data Plane]
+    Ingest --> Indexer[Extractor/Indexer\n(text/layout/KV, embeddings)]
+    GW --> Orchestrator[PROM Orchestrator]
+    Orchestrator --> Binder[Binder\n(var fill + preamble)]
+    Orchestrator --> Exec[Executor\n(LLM+Tools, per-check)]
+    Orchestrator --> Val[Deterministic Validators]
+    Orchestrator --> Critic[Critic LLM\n(contradiction scan)]
+  end
+
+  subgraph Stores[Batch-Scoped Stores]
+    Man[Manifest DB]
+    Blob[Blob Store\n(PDFs, DocAI JSON)]
+    Vec[Vector Index\nvs://batch/{id}]
+    Graph[Workspace Graph\ngraph://batch/{id}]
+    Ev[Evidence & Results DB]
+  end
+
+  Ingest --> Man
+  Indexer --> Vec
+  Indexer --> Graph
+  Indexer --> Blob
+
+  Exec --> Ev
+  Val --> Ev
+  Critic --> Ev
+  Orchestrator --> Ev
+
+  subgraph Tools[Batch-bound External Tools]
+    Core[Core System API]
+    Indigo[Indigo/KYC API]
+    Sanctions[Sanctions/PEP]
+  end
+
+  Exec --> Core
+  Exec --> Indigo
+  Exec --> Sanctions
+
+  subgraph Fleet[Privacy-Safe Fleet Analytics]
+    Met[Aggregates: check failure rates,\nmissing bindings, latency]
+    Risk[Anomaly Service\n(offline model)]
+  end
+
+  Ev --> Met
+  Met --> Risk
+
+  Reg --> Orchestrator
+  Reg --> Exec
+  UI --> sequenceDiagram
+  participant A as Agent Session
+  participant Ctx as Context Manager
+  A->>Ctx: attach(BATCH-101)
+  Note right of Ctx: mount graph/vector; clear KV
+  A->>A: run flow on 101
+  A->>Ctx: detach()
+  Note right of Ctx: purge session caches
+  A->>Ctx: attach(BATCH-202)
+  A->>A: run flow on 202
+
+Batch(batch_id PK, case_ref, source_system, received_at, state, manifest_hash)
+	•	Document(doc_id PK, batch_id FK, filename, doctype, sha256, pages)
+	•	Extraction(doc_id, type[text|kv|table|layout], pointer, created_at)
+	•	FlowRun(run_id PK, batch_id, type_id, version, variants[], status, model_id, type_config_hash)
+	•	CheckResult(run_id, check_id, status, answer_json, citations_json, prompt_hash, started_at, ended_at)
+	•	Evidence(batch_id, doc_id, page, bbox, system_ref, claim_id)
+	•	MetricsAgg(window, check_id, doctype, failure_rate, missing_bindings, p95_latency, dp_noise_tag)
+
+
+check_id: rate_consistency
+authority_refs: [{OCC: "LN-7.4.2"}]
+policy_refs: [{WF: "SETTLEMENT-2025.1 §3.1"}]
+requires: [doc.interest_rate, core.payment_schedule_rate]
+prompt_template: |
+  Compare {{doc.interest_rate}} vs {{core.payment_schedule_rate}}.
+  Return JSON: {"match": true|false, "doc_rate": number, "core_rate": number, "citations": [...]}
+output_schema:
+  type: object
+  properties:
+    match: {type: boolean}
+    doc_rate: {type: number}
+    core_rate: {type: number}
+    citations: {type: array}
+validators:
+  - type: equality
+    left: "$.doc_rate"
+    right: "$.core_rate"
+    tolerance: 0.0001
+failure_message: "Agreement rate differs from Core"
+
+
+type_id: loan_settlement
+version: 2025.1
+flow:
+  - check: rate_consistency
+    on_fail: halt
+  - check: maturity_after_today
+    on_fail: warn
+  - check: signature_matches_kyc
+    on_fail: halt
+variants:
+  collateralized:
+    extends: [collateral_perfection, lien_priority_confirmed]
+
+
+•	Batches
+	•	POST /batches → create manifest, return batch_id
+	•	POST /batches/{id}/index → run extraction → build graph/vector
+	•	GET /batches/{id}/report → consolidated results + evidence
+	•	Flows
+	•	POST /flows/run {batch_id, type_id, version, variants[]} → run_id
+	•	GET /flows/{run_id}/results
+	•	PROM Ops
+	•	POST /prom/resolve → expanded flow + hashes
+	•	POST /prom/bind → prompts + expected schemas
+	•	POST /prom/execute → results (JSON) + citations
+	•	GET /prom/audit/{run_id}
+	•	Agent Session (for multiplexing)
+	•	POST /agent/sessions
+	•	POST /agent/{sid}/attach_batch {batch_id}
+	•	POST /agent/{sid}/detach_batch
+
+
+
+Security & Memory Controls
+	•	Batch-scoped tool tokens (JWT includes batch_id); server verifies on every call.
+	•	KV/cache cleared on attach/detach; never reused across batches.
+	•	“No citation ⇒ no answer” rule; schema/validator failures hard-fail checks.
+	•	PII never leaves batch stores; Fleet metrics are aggregate only (optional DP noise).
+
+Observability
+	•	Tracing: trace_id, batch_id, run_id, check_id across services (OTel).
+	•	Metrics: p50/p95 LLM latency per check, validator fail rates, tool error rates.
+	•	Logs: redaction at sink; link every answer to citations and prompt_hash.
+
+Deployment (reference)
+	•	Kubernetes: separate control-plane (Registry, Scheduler) and data-plane (Orchestrator, Executor, Validators, Critic).
+	•	Queues: SQS/Rabbit/Kafka for flows.run jobs with per-batch concurrency=1.
+	•	Stores: Postgres (Manifests/Evidence), S3-compatible (Blob), Neo4j/Arango (Graph) or SQLite/pgvector for a lean start, FAISS/Qdrant for vectors.
+	•	Secrets: Vault/SM; per-env model endpoints; RLS in Postgres keyed by batch_id.
+
+
+Test Plan (essentials)
+	•	Isolation tests: prove Batch A prompts can’t access Batch B docs/tools.
+	•	Determinism: identical manifest → same run_id, same results.
+	•	Validator suites: synthetic edge cases (name homographs, redactions, date edge).
+	•	Chaos: tool timeouts, partial extractions, retry/backoff, idempotent jobs.
