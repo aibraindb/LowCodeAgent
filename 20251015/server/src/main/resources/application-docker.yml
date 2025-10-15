@@ -1,0 +1,21 @@
+server.port: 8080
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USER}
+    password: ${DB_PASS}
+  jpa:
+    hibernate.ddl-auto: validate
+    properties.hibernate.jdbc.time_zone: UTC
+  redis:
+    url: ${REDIS_URL}
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP}
+    consumer: { group-id: ai-group, auto-offset-reset: earliest }
+    properties: { "spring.json.trusted.packages": "*" }
+
+ai:
+  arango: { url: ${ARANGO_URL}, user: ${ARANGO_USER}, pass: ${ARANGO_PASS} }
+  chroma: { url: ${CHROMA_URL} }
+  meili:  { url: ${MEILI_URL} }
+  langfuse: { baseUrl: ${LANGFUSE_BASEURL}, publicKey: ${LANGFUSE_PUBLIC_KEY}, secretKey: ${LANGFUSE_SECRET_KEY} }
